@@ -1,2 +1,210 @@
-///////PER-PROTOCOL EFFECT////////
+///////////////////////////////////
+////PER-PROTOCOL EFFECT ANALYSIS///
+//////////////////////////////////
 
+/////////////////////
+//DATA PROCESSING////
+/////////////////////
+
+/*Now, we censor everyone the first time they stop adhering in both exposure groups*/
+mark adhr if treatment!= treatment_b
+label define adhrence 0 "adherence" 1 "non-adherence"
+label values adhr adhrence
+sort newid time
+by newid, sort: egen cens = min(cond(adhr == 1),year, .)
+gen cens_new = 0
+replace cens_new = 1 if year == cens
+replace cens_new = . if year > cens
+label var cens_new "first time they stop adhering, cens_new==1"
+
+/*only keep the variables we need*/
+
+keep newid lopnr yr year kon treatment_b treatment adhr cens_new time age ar edulevel cbirth family unemployment health_problem death_2
+
+
+/////////////////////
+//WEIGHTS CREATION///
+/////////////////////
+
+//need to create baseline variables (one variable with the baseline values): 
+
+foreach var of varlist unemployment age edulevel family health_problem children marital adhr {
+by newid: gen `var'_b = `var' if time==0
+by newid: replace `var'_b  =`var'_b[1] if missing(`var'_b) 
+}
+
+/*Weights separately by exposure group: PE and initiation to SER*/
+
+/* Numerator: Pr(adhr(t)=1, Baseline covariates)*/
+/* Create predicted probability at each time point */
+
+logit adhr time c.time#c.time i.unemployment_b age_b i.edulevel_b i.family_b i.health_problem_b i.cbirth i.kon  if treatment_b == 1 & time > 0, cluster(newid)
+predict pnum_1 if treatment_b == 1, pr
+
+logit adhr time c.time#c.time i.unemployment_b age_b i.edulevel_b i.family_b i.health_problem_b i.cbirth i.kon  if treatment_b == 0 & time > 0, cluster(newid)
+predict pnum_0 if treatment_b == 0, pr
+	
+/* Denominator: Pr(adhr(t)=1, Baseline covariates, Time-varying covariates)*/
+/* Create predicted probability at each time point */
+
+logit adhr time c.time#c.time i.unemployment_b age_b i.edulevel_b i.family_b i.health_problem_b i.cbirth i.kon age i.edulevel i.family i.unemployment i.health_problem if treatment_b == 1 & time > 0, cluster(newid)
+predict pdenom_1 if treatment_b == 1, pr
+
+logit adhr time c.time#c.time i.unemployment_b age_b i.edulevel_b i.family_b i.health_problem_b i.cbirth i.kon age i.edulevel i.family i.unemployment i.health_problem if treatment_b == 0 & time > 0, cluster(newid)
+predict pdenom_0 if treatment_b == 0, pr
+
+/*sort by newid and time*/
+sort newid time
+
+/*Calculate the weights (stabilized, truncated at 99thpercentile and unstabilized*/ 
+gen numcont = 1 if time == 0
+gen dencont = 1 if time == 0
+replace numcont = adhr*pnum_1 + (1-adhr)*(1-pnum_1) if treatment_b == 1
+replace dencont = adhr*pdenom_1 + (1-adhr)*(1-pdenom_1) if treatment_b == 1
+replace numcont = adhr*pnum_0 + (1-adhr)*(1-pnum_0) if treatment_b == 0
+replace dencont = adhr*pdenom_0 + (1-adhr)*(1-pdenom_0) if treatment_b == 0
+
+gen _t = time + 1
+gen k1_0 = 1 if _t == 1
+gen k1_w = 1 if _t == 1
+replace k1_0 = numcont*k1_0[_n-1] if _t > 1
+replace k1_w = dencont*k1_w[_n-1] if _t > 1
+
+gen unstabw = 1.0/k1_w
+gen stabw = k1_0/k1_w
+
+gen stabw_t = stabw
+replace stabw_t = r(p99) if stabw_t > r(p99)
+
+summarize unstabw, detail
+summarize stabw, detail
+summarize stabw_t, detail
+
+
+//////////////////////////////////////
+//WEIGHTED CONDITIONAL HAZARD RATIOS//
+//////////////////////////////////////
+
+/* Calculate the baseline covariate-adjusted hazard ratio from a pooled logistic regression model*/
+/* This step is restricted to only the uncensored person-time + use weights (truncated weights)*/
+logistic death_2 time i.treatment_b c.time#c.time i.unemployment_b age_b i.edulevel_b i.family_b i.health_problem_b i.cbirth i.kon if cens_new == 0 [pweight = stabw_t] , cluster(newid) //RR: 0.71 (0.54-0.94)
+
+/////////////////////////////
+//WEIGHTED SURVIVAL CURVES//
+////////////////////////////
+
+preserve
+
+/* Step 1. Calculate the baseline covariate-adjusted hazard ratio from a pooled logistic regression model*/
+/*Restricted to only the uncensored person-time*/
+
+logistic death_2 time c.time#c.time i.treatment_b c.time#treatment_b i.treatment_b#c.time#c.time i.unemployment_b age_b i.edulevel_b i.family_b i.health_problem_b i.cbirth i.kon if cens_new == 0 [pweight = stabw_t] , cluster(newid)
+
+/* Step 2. Create simulated data where everyone is treated & Create simulated data where everyone is untreated*/
+drop if time != 0 
+expand 12 if time ==0 
+bysort newid: replace time = _n -1 
+
+/* Step 3. Set the treatment assignment to '1' for each individual and recreate  visit and interaction terms, Set the treatment assignment to '0' for each individual and recreate  visit and interaction terms*/
+expand 2, generate(interv) 
+replace treatment_b = interv 
+
+/* Step 4. Calculate the predicted survival at each time and calculate survival from the cumulative product for each individual*/
+predict pevent_k, pr 
+gen psurv_k = 1-pevent_k 
+keep newid time treatment_b interv psurv_k
+sort newid interv time
+gen _t = time + 1
+gen psurv = psurv_k if _t == 1
+bysort newid interv: replace psurv = psurv_k*psurv[_t-1] if _t > 1
+
+/* Step 5. Calculate standardized survival at each time*/
+/* Create concatenated dataset, only keep s, rand, and visit*/
+by interv time, sort: summarize psurv
+keep newid psurv treatment_b interv time 
+bysort interv time: egen meanS = mean(psurv)
+
+/* Step 6. Edit results to reflect that the estimates are for the end of the interval [t, t+1)*/
+/* The code below duplicates baseline, sets survival to 100% in the duplicate and adds 1 to the year count for each other record*/
+expand 2 if time == 0, generate(newtime)
+replace meanS = 1 if newtime ==1
+gen time2 = 0 if newtime == 1
+replace time2 = time + 1 if newtime ==0
+
+/* Step 7. Plot the results standarized risk curves*/
+gen meanCI= 1- meanS
+separate meanCI, by(interv)
+gen meanCI0_1000= meanCI0*1000
+gen meanCI1_1000= meanCI1*1000
+twoway (line meanCI0_1000 time2, sort) (line meanCI1_1000 time2, sort),  xlabel(#13) ytitle(Cumulative all-cause mortality incidence per 1000 persons) xtitle (Years of follow-up) title(Risk Curves Standardized for Baseline Covariate Distribution and weighted for time-varying confounding)
+
+/* Step 8. Print cumulative incidence of mortality in SER, in PER and CIR at time 11 (12-years of follow-up)*/
+bysort treatment_b: egen meanS_11 = mean (psurv) if time == 11
+gen meanI_11 = (1- meanS_11)*1000
+quietly summarize meanI_11 if(treatment_b==0 & time ==11)
+matrix input observe = (0, `r(mean)')
+quietly summarize meanI_11 if(treatment_b==1 & time ==11)
+matrix observe = (observe\1,`r(mean)')
+matrix observe = (observe\2, ((observe[2,2])-(observe[1,2])))
+matrix observe = (observe\3, ((observe[2,2])/(observe[1,2])))
+matrix rownames observe = CumInc_PE CumInc_SER risk_diff RR  
+matrix list observe
+restore
+
+//alternative 2: cumulative incidence of mortality in SER, in PER and CIR at time 6 (6-years of follow-up): 
+bysort treatment_b: egen meanS_6 = mean (psurv) if time == 5
+gen meanI_6 = (1- meanS_6)*1000
+quietly summarize meanI_6 if(treatment_b==0 & time ==5)
+matrix input observe = (0, `r(mean)')
+quietly summarize meanI_6 if(treatment_b==1 & time ==5)
+matrix observe = (observe\1,`r(mean)')
+matrix observe = (observe\2, ((observe[2,2])-(observe[1,2])))
+matrix observe = (observe\3, ((observe[2,2])/(observe[1,2])))
+matrix rownames observe = CumInc_PE CumInc_SER risk_diff RR  
+matrix list observe
+restore
+
+
+/////////////////////////////
+/////////BOOTSTRAP//////////
+////////////////////////////
+
+capture program drop bootstdz_surv 
+program define bootstdz_surv , rclass
+        use "W:\C6_Arbetsmedicin\STAFF\Nuria Matilla\PWR\MORTALITY\data\per_protocol_analyses_2.dta", clear
+		preserve
+		bsample, cluster(newid) idcluster(new_newid)  		
+       logistic death_2 time c.time#c.time i.treatment_b c.time#treatment_b treatment_b#c.time#c.time i.unemployment_b age_b i.edulevel_b i.family_b i.health_problem_b i.cbirth i.kon if cens_new == 0 [pweight = stabw_t]
+		 drop if time != 0	
+		/*only predict on new version of data */
+	    expand 12 if time ==0 
+		bysort new_newid: replace time = _n -1 		 		
+	    expand 2, generate(interv_b) 
+        replace treatment_b = interv_b 		 
+	    predict pevent_k, pr
+	    gen psurv_k = 1-pevent_k
+        keep newid time treatment_b psurv_k 		       	
+		sort newid treatment_b time
+	    gen _t = time + 1
+	    gen psurv = psurv_k if _t ==1 	
+	    bysort newid  treatment_b: replace psurv = psurv_k*psurv[_t-1] if _t >1 
+	    drop if time != 5   /* keep only last observation */
+		keep  newid treatment_b psurv    
+		/* if time is in data for complete graph add time to bysort */
+		bysort treatment_b: egen meanS_b = mean (psurv)
+		gen meanI_b = (1- meanS_b)*1000
+		keep newid treatment_b meanI_b
+		drop if newid != 1
+		drop newid
+		return scalar boot_0 = meanI_b[1]
+		return scalar boot_1 = meanI_b[2]
+		return scalar boot_diff = return(boot_1) - return(boot_0)
+		return scalar boot_RR = return(boot_0)/return(boot_1)
+	   restore
+end		
+set rmsg on
+simulate Inc_SER = r(boot_0) Inc_PER = r(boot_1) difference=r(boot_diff) RR = r(boot_RR) , reps(500) seed(5)  : bootstdz_surv
+set rmsg off 
+ 
+matrix pe = observe[1..4, 2]'
+bstat, stat(pe) n(251274)
