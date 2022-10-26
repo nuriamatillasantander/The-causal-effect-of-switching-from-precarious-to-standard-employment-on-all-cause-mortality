@@ -1,2 +1,134 @@
-/////INTENTION TO TREAT ANALYSIS /////
 
+///////////////////////////////////
+////INTENTION TO TREAT ANALYSIS////
+///////////////////////////////////
+
+**The code is based in the code of Chapter 17 of the book "What if?" (https://www.hsph.harvard.edu/miguel-hernan/causal-inference-book/) and the code from Elanor Murray (https://github.com/eleanormurray/CausalSurvivalAnalysisWorkshop/blob/master/Stata/trial1.dta)
+
+
+
+////////////////////////////
+//UNADJUSTED HAZARD RATIOS//
+///////////////////////////
+/* Data processing: create squared time variable [time2]*/
+gen time2= time*time
+
+/* Calculate the unadjusted hazard ratio from a pooled logistic regression model, with robust standard errors*/
+logistic death_2 i.treatment_b time2 time, cluster(newid)
+
+ 
+/////////////////////////////
+//CONDITIONAL HAZARD RATIOS//
+////////////////////////////	
+/* Calculate the baseline covariate-adjusted hazard ratio from a pooled logistic regression model*/
+logistic death_2 i.treatment_b time2 time  age_b i.kon i.cbirth i.edulevel_b i.family_b i.health_problem_b, cluster(newid) 	
+
+
+/////////////////////////////////////////////////////////////////////////////////
+//// THE PARAMETRIC G-FORMULA: STANDARDIZATION BASED ON PARAMETRIC MODELS///////
+////////////////////////////////////////////////////////////////////////////////
+
+/* Step 1. Data processing: interaction terms*/
+preserve
+
+/* Step 2. Fit a pooled logistic regression model with interaction terms between treatment_b and time & time2 to allow flexible fitting of baseline hazard, and save the coefficients*/ 
+
+logistic death_2 i.treatment_b time i.treatment_b#c.time c.time#c.time i.treatment_b#c.time#c.time age_b i.kon i.cbirth i.edulevel_b i.family_b i.health_problem_b , cluster(newid)
+
+
+/* Step 3. Create simulated data where everyone is treated & Create simulated data where everyone is untreated*/
+/* Expand baseline so it contains a year at each time point for every individual 
+where the baseline information has been carried forward at each time*/
+drop if time != 0 
+expand 12 if time ==0 
+bysort newid: replace time = _n -1 
+
+/*Step 4.Set the treatment assignment (exposure) to '1' for each individual and recreate time and interaction terms & Set the treatment assignment (exposure) to '0' for each individual and recreate time and interaction terms*/
+expand 2, generate(interv) 
+replace treatment_b = interv 
+
+/* Step 5. Calculate the predicted survival at each time and calculate survival from the cumulative product for each individual (psurv)*/
+predict pevent_k, pr 
+gen psurv_k = 1-pevent_k 
+keep newid time treatment_b interv psurv_k
+sort newid interv time
+gen _t = time + 1
+gen psurv = psurv_k if _t == 1
+bysort newid interv: replace psurv = psurv_k*psurv[_t-1] if _t > 1
+
+/* Step 6. Calculate standardized survival at each time*/
+/* Create concatenated dataset*/
+by interv time, sort: summarize psurv
+keep newid psurv treatment_b interv time 
+/* Calculate the mean survival at each year within each exposure arm*/
+bysort interv time: egen meanS = mean(psurv)
+/* Edit results to reflect that our estimates are for the END of the interval [t, t+1)*/
+/* The code below duplicates baseline, sets survival to 100% in the duplicate and adds 1 to the year for each other record*/
+/*with the mean survival the cumulative incidence (meanCI) can be calculated as well */
+expand 2 if time == 0, generate(newtime)
+replace meanS = 1 if newtime ==1
+gen time_2 = 0 if newtime == 1
+replace time_2 = time + 1 if newtime ==0
+
+gen meanCI= 1- meanS
+
+/* Step 7. Plot the results: Standardized risk curves */
+separate meanCI, by(interv)
+gen meanCI0_1000= meanCI0*1000
+gen meanCI1_1000= meanCI1*1000
+twoway (line meanCI0_1000 time_2, sort) (line meanCI1_1000 time_2, sort), xlabel(#13) ytitle(Cumulative all-cause mortality incidence per 1000 persons) xtitle (Years of follow-up) title(Risk Curves Standardized for Baseline Covariate Distribution)
+
+/* Step 8. Print cumulative incidence of mortality in SER, in PER and CIR at time 11 (12-years of follow-up)*/ 
+
+bysort treatment_b: egen meanS_11 = mean (psurv) if time == 11
+gen meanI_11 = (1- meanS_11)*1000
+quietly summarize meanI_11 if(treatment_b==0 & time ==11)
+matrix input observe = (0, `r(mean)')
+quietly summarize meanI_11 if(treatment_b==1 & time ==11)
+matrix observe = (observe\1,`r(mean)')
+matrix observe = (observe\2, ((observe[2,2])-(observe[1,2])))
+matrix observe = (observe\3, ((observe[2,2])/(observe[1,2])))
+matrix rownames observe = CumInc_PE CumInc_SER risk_diff RR  
+matrix list observe
+restore
+
+/*Step 9. Bootstrap*/
+//note: code from chapter 17, program 17.4 of What if book//
+
+capture program drop bootstdz_surv 
+program define bootstdz_surv , rclass
+        use "W:\C6_Arbetsmedicin\STAFF\Nuria Matilla\PWR\MORTALITY\data\per_protocol_analyses_1.dta", clear
+		drop if year>ar_2
+		preserve
+		bsample, cluster(newid) idcluster(new_newid)  		
+        logistic death_2 i.treatment_b time i.treatment_b#c.time c.time#c.time i.treatment_b#c.time#c.time age_b i.kon i.cbirth i.edulevel_b i.family_b i.health_problem_b
+		 drop if time != 0	
+	    expand 12 if time ==0 
+		bysort new_newid: replace time = _n -1 		 		
+	    expand 2, generate(interv_b) 
+        replace treatment_b = interv_b 		 
+	    predict pevent_k, pr
+	    gen psurv_k = 1-pevent_k
+        keep newid time treatment_b psurv_k 		       	
+		sort newid treatment_b time
+	    gen _t = time + 1
+	    gen psurv = psurv_k if _t ==1 	
+	    bysort newid  treatment_b: replace psurv = psurv_k*psurv[_t-1] if _t >1 
+	    drop if time != 11   
+		keep  newid treatment_b psurv    
+		bysort treatment_b: egen meanS_b = mean (psurv)
+		gen meanI_b = (1- meanS_b)*1000
+		keep newid treatment_b meanI_b
+		drop if newid != 1
+		drop newid
+		return scalar boot_0 = meanI_b[1]
+		return scalar boot_1 = meanI_b[2]
+		return scalar boot_diff = return(boot_1) - return(boot_0)
+		return scalar boot_RR = return(boot_0)/return(boot_1)
+	   restore
+end		
+set rmsg on
+simulate Inc_SER = r(boot_0) Inc_PER = r(boot_1) difference=r(boot_diff) RR = r(boot_RR) , reps(500) seed(5)  : bootstdz_surv
+set rmsg off 
+matrix pe = observe[1..4, 2]'
+bstat, stat(pe) n(251274)
